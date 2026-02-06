@@ -1,0 +1,15 @@
+[package]
+name = "rybyte_image_converter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+image = "0.24"
+thiserror = "1.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
