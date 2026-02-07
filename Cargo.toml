@@ -1,6 +1,6 @@
 [package]
 name = "rybyte_image_converter"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["RYBYTE", "Rybitva Danil Andreevich"]
 license = "PolyForm Noncommercial 1.0.0"
