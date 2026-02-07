@@ -148,6 +148,9 @@ impl Default for IcoSettings {
 pub struct ImageConverter {
     output_format: Format,
     compression: CompressionSettings,
+    target_width: u32,
+    target_height: u32,
+    keep_aspect_ratio: bool,
 }
 
 impl ImageConverter {
@@ -155,11 +158,21 @@ impl ImageConverter {
         Self {
             output_format,
             compression: CompressionSettings::default(),
+            target_width: 0,
+            target_height: 0,
+            keep_aspect_ratio: false,
         }
     }
     
     pub fn with_compression(mut self, compression: CompressionSettings) -> Self {
         self.compression = compression;
+        self
+    }
+    
+    pub fn with_target_size(mut self, width: u32, height: u32, keep_aspect_ratio: bool) -> Self {
+        self.target_width = width;
+        self.target_height = height;
+        self.keep_aspect_ratio = keep_aspect_ratio;
         self
     }
     
@@ -193,38 +206,67 @@ impl ImageConverter {
         self
     }
     
+    fn resize_image(&self, img: DynamicImage) -> DynamicImage {
+        if self.target_width == 0 && self.target_height == 0 {
+            return img;
+        }
+        
+        if self.target_width == 0 || self.target_height == 0 {
+            let (width, height) = if self.target_width == 0 {
+                let new_height = self.target_height;
+                let ratio = new_height as f32 / img.height() as f32;
+                let new_width = (img.width() as f32 * ratio).round() as u32;
+                (new_width, new_height)
+            } else {
+                let new_width = self.target_width;
+                let ratio = new_width as f32 / img.width() as f32;
+                let new_height = (img.height() as f32 * ratio).round() as u32;
+                (new_width, new_height)
+            };
+            
+            return img.resize(width, height, image::imageops::FilterType::Lanczos3);
+        }
+        
+        if self.keep_aspect_ratio {
+            img.resize(self.target_width, self.target_height, image::imageops::FilterType::Lanczos3)
+        } else {
+            img.resize_exact(self.target_width, self.target_height, image::imageops::FilterType::Lanczos3)
+        }
+    }
+    
     pub fn convert(&self, input_data: &[u8]) -> Result<Vec<u8>> {
         let img = image::load_from_memory(input_data)?;
         self.convert_image(&img)
     }
     
     pub fn convert_image(&self, img: &DynamicImage) -> Result<Vec<u8>> {
+        let img = self.resize_image(img.clone());
         let mut output = Cursor::new(Vec::new());
         
         match self.output_format {
             Format::Png => {
-                self.encode_png(img, &mut output)?;
+                self.encode_png(&img, &mut output)?;
             }
             Format::Jpeg => {
-                self.encode_jpeg(img, &mut output)?;
+                self.encode_jpeg(&img, &mut output)?;
             }
             Format::Ico => {
-                self.encode_ico(img, &mut output)?;
+                self.encode_ico(&img, &mut output)?;
             }
             Format::Tiff => {
-                self.encode_tiff(img, &mut output)?;
+                self.encode_tiff(&img, &mut output)?;
             }
             Format::Bmp => {
-                self.encode_bmp(img, &mut output)?;
+                self.encode_bmp(&img, &mut output)?;
             }
             Format::Dds => {
-                self.encode_dds(img, &mut output)?;
+                self.encode_dds(&img, &mut output)?;
             }
             Format::Hdr => {
-                self.encode_hdr(img, &mut output)?;
+                self.encode_hdr(&img, &mut output)?;
             }
             Format::Farbfeld => {
-                self.encode_farbfeld(img, &mut output)?;
+                self.encode_farbfeld(&img, &mut output)?;
             }
             _ => {
                 img.write_to(&mut output, self.output_format.to_image_format())?;
@@ -612,6 +654,9 @@ pub mod ffi {
         ico_max_dimension: u32,
         ico_generate_multiple: bool,
         dds_mipmaps: bool,
+        target_width: u32,
+        target_height: u32,
+        keep_aspect_ratio: bool,
         output: *mut *mut ImageData,
     ) -> ResultCode {
         if input_data.is_null() || output.is_null() {
@@ -632,7 +677,8 @@ pub mod ffi {
         };
         
         let converter = ImageConverter::new(output_format)
-            .with_compression(compression);
+            .with_compression(compression)
+            .with_target_size(target_width, target_height, keep_aspect_ratio);
         
         match converter.convert(input_slice) {
             Ok(mut result) => {
@@ -683,6 +729,9 @@ pub mod ffi {
             256,
             false,
             true,
+            0,  // target_width
+            0,  // target_height
+            false, // keep_aspect_ratio
             output,
         )
     }
@@ -892,5 +941,44 @@ mod tests {
         let converter = ImageConverter::new(Format::Farbfeld);
         let result = converter.convert(&test_data);
         assert!(result.is_err());
+    }
+    
+    #[test]
+    fn test_resize_logic() {
+        let png_data = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x10,
+            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+            0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,
+            0x54, 0x28, 0x91, 0x63, 0x60, 0x60, 0x60, 0x60,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x28, 0xAE,
+            0x0F, 0x20, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+            0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        
+        let converter = ImageConverter::new(Format::Png);
+        let result = converter.convert(&png_data);
+        assert!(result.is_ok());
+        
+        let converter = ImageConverter::new(Format::Png)
+            .with_target_size(50, 50, false);
+        let result = converter.convert(&png_data);
+        assert!(result.is_ok());
+        
+        let converter = ImageConverter::new(Format::Png)
+            .with_target_size(50, 0, false);
+        let result = converter.convert(&png_data);
+        assert!(result.is_ok());
+        
+        let converter = ImageConverter::new(Format::Png)
+            .with_target_size(0, 50, false);
+        let result = converter.convert(&png_data);
+        assert!(result.is_ok());
+        
+        let converter = ImageConverter::new(Format::Png)
+            .with_target_size(50, 100, true);
+        let result = converter.convert(&png_data);
+        assert!(result.is_ok());
     }
 }
