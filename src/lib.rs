@@ -1,7 +1,6 @@
 use image::{
     DynamicImage, ImageError, ImageFormat,
-    codecs::jpeg::JpegEncoder,
-    codecs::png::{PngEncoder, CompressionType, FilterType},
+    codecs::png::{PngEncoder, CompressionType, FilterType as ImageFilterType},
     codecs::ico::IcoEncoder,
     codecs::bmp::BmpEncoder,
     codecs::tiff::TiffEncoder,
@@ -10,6 +9,8 @@ use image::{
 use std::io::{Cursor, Write};
 use thiserror::Error;
 use ddsfile::{Dds, NewDxgiParams, DxgiFormat, Caps2, AlphaMode, D3D10ResourceDimension};
+use mozjpeg::{Compress, ColorSpace as MozColorSpace, ScanMode};
+pub mod ffi;
 
 #[derive(Error, Debug)]
 pub enum ConversionError {
@@ -36,6 +37,13 @@ pub enum ConversionError {
     
     #[error("Farbfeld error: {0}")]
     FarbfeldError(String),
+    
+    #[error("JPEG error: {0}")]
+    JpegError(String),
+    
+    #[cfg(feature = "webp-encoding")]
+    #[error("WebP error: {0}")]
+    WebPError(String),
 }
 
 pub type Result<T> = std::result::Result<T, ConversionError>;
@@ -74,7 +82,8 @@ impl Format {
             Format::Farbfeld => ImageFormat::Farbfeld,
         }
     }
-    
+
+    #[allow(dead_code)]
     fn supports_alpha(self) -> bool {
         matches!(
             self,
@@ -83,13 +92,49 @@ impl Format {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum JpegSubsampling {
+    None,
+    Ratio422,
+    Ratio420,
+    Ratio440,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum JpegOptimization {
+    Speed,
+    Balanced,
+    Size,
+    Quality,
+}
+
 #[derive(Debug, Clone)]
-pub struct CompressionSettings {
-    pub jpeg_quality: u8,
-    pub png_compression: u8,
-    pub png_filter: PngFilterType,
-    pub ico_settings: IcoSettings,
-    pub dds_mipmaps: bool,
+pub struct JpegSettings {
+    pub quality: u8,
+    pub progressive: bool,
+    pub subsampling: JpegSubsampling,
+    pub optimization: JpegOptimization,
+    pub arithmetic_coding: bool,
+    pub smoothing: u8,
+    pub trellis_optimization: bool,
+    pub progressive_scans: u8,
+}
+
+impl Default for JpegSettings {
+    fn default() -> Self {
+        Self {
+            quality: 90,
+            progressive: false,
+            subsampling: JpegSubsampling::Ratio420,
+            optimization: JpegOptimization::Balanced,
+            arithmetic_coding: false,
+            smoothing: 0,
+            trellis_optimization: true,
+            progressive_scans: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +145,113 @@ pub enum PngFilterType {
     Up,
     Avg,
     Paeth,
+    Adaptive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum PngCompressionType {
+    Fast,
+    Default,
+    Best,
+    Huffman,
+}
+
+#[derive(Debug, Clone)]
+pub struct PngSettings {
+    pub compression_level: u8,
+    pub compression_type: PngCompressionType,
+    pub filter: PngFilterType,
+    pub interlaced: bool,
+    pub strip_metadata: bool,
+    pub bit_depth: u8,
+}
+
+impl Default for PngSettings {
+    fn default() -> Self {
+        Self {
+            compression_level: 6,
+            compression_type: PngCompressionType::Default,
+            filter: PngFilterType::Sub,
+            interlaced: false,
+            strip_metadata: false,
+            bit_depth: 0,
+        }
+    }
+}
+
+impl PngFilterType {
+    fn to_filter_type(self) -> ImageFilterType {
+        match self {
+            PngFilterType::NoFilter => ImageFilterType::NoFilter,
+            PngFilterType::Sub => ImageFilterType::Sub,
+            PngFilterType::Up => ImageFilterType::Up,
+            PngFilterType::Avg => ImageFilterType::Avg,
+            PngFilterType::Paeth => ImageFilterType::Paeth,
+            PngFilterType::Adaptive => ImageFilterType::Adaptive,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum WebPPreset {
+    Default,
+    Picture,
+    Photo,
+    Drawing,
+    Icon,
+    Text,
+}
+
+#[derive(Debug, Clone)]
+pub struct WebPSettings {
+    pub quality: f32,
+    pub lossless: bool,
+    pub method: u8,
+    pub preset: WebPPreset,
+    pub threading: bool,
+    pub target_size: usize,
+}
+
+impl Default for WebPSettings {
+    fn default() -> Self {
+        Self {
+            quality: 80.0,
+            lossless: false,
+            method: 4,
+            preset: WebPPreset::Default,
+            threading: true,
+            target_size: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum TiffCompression {
+    None,
+    Lzw,
+    Deflate,
+    PackBits,
+    Jpeg,
+}
+
+#[derive(Debug, Clone)]
+pub struct TiffSettings {
+    pub compression: TiffCompression,
+    pub jpeg_quality: u8,
+    pub predictor: bool,
+}
+
+impl Default for TiffSettings {
+    fn default() -> Self {
+        Self {
+            compression: TiffCompression::Lzw,
+            jpeg_quality: 90,
+            predictor: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,33 +259,8 @@ pub enum PngFilterType {
 pub struct IcoSettings {
     pub max_dimension: u32,
     pub generate_multiple_sizes: bool,
-}
-
-impl Default for CompressionSettings {
-    fn default() -> Self {
-        Self {
-            jpeg_quality: 90,
-            png_compression: 6,
-            png_filter: PngFilterType::Sub,
-            ico_settings: IcoSettings {
-                max_dimension: 256,
-                generate_multiple_sizes: false,
-            },
-            dds_mipmaps: true,
-        }
-    }
-}
-
-impl PngFilterType {
-    fn to_filter_type(self) -> FilterType {
-        match self {
-            PngFilterType::NoFilter => FilterType::NoFilter,
-            PngFilterType::Sub => FilterType::Sub,
-            PngFilterType::Up => FilterType::Up,
-            PngFilterType::Avg => FilterType::Avg,
-            PngFilterType::Paeth => FilterType::Paeth,
-        }
-    }
+    pub sizes: [u32; 8],
+    pub num_sizes: usize,
 }
 
 impl Default for IcoSettings {
@@ -141,6 +268,125 @@ impl Default for IcoSettings {
         Self {
             max_dimension: 256,
             generate_multiple_sizes: false,
+            sizes: [16, 32, 48, 64, 128, 256, 0, 0],
+            num_sizes: 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum DdsFormat {
+    RGBA8,
+    BC1,
+    BC2,
+    BC3,
+    BC4,
+    BC5,
+    BC6H,
+    BC7,
+}
+
+#[derive(Debug, Clone)]
+pub struct DdsSettings {
+    pub format: DdsFormat,
+    pub generate_mipmaps: bool,
+    pub mipmap_count: u32,
+    pub is_cubemap: bool,
+}
+
+impl Default for DdsSettings {
+    fn default() -> Self {
+        Self {
+            format: DdsFormat::RGBA8,
+            generate_mipmaps: true,
+            mipmap_count: 0,
+            is_cubemap: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GifSettings {
+    pub palette_size: u16,
+    pub dithering: bool,
+    pub quality: u8,
+}
+
+impl Default for GifSettings {
+    fn default() -> Self {
+        Self {
+            palette_size: 256,
+            dithering: false,
+            quality: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompressionSettings {
+    pub jpeg: JpegSettings,
+    pub png: PngSettings,
+    pub webp: WebPSettings,
+    pub tiff: TiffSettings,
+    pub ico: IcoSettings,
+    pub dds: DdsSettings,
+    pub gif: GifSettings,
+}
+
+impl Default for CompressionSettings {
+    fn default() -> Self {
+        Self {
+            jpeg: JpegSettings::default(),
+            png: PngSettings::default(),
+            webp: WebPSettings::default(),
+            tiff: TiffSettings::default(),
+            ico: IcoSettings::default(),
+            dds: DdsSettings::default(),
+            gif: GifSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum ResizeFilter {
+    Nearest,
+    Triangle,
+    CatmullRom,
+    Gaussian,
+    Lanczos3,
+}
+
+impl ResizeFilter {
+    fn to_image_filter(self) -> image::imageops::FilterType {
+        match self {
+            ResizeFilter::Nearest => image::imageops::FilterType::Nearest,
+            ResizeFilter::Triangle => image::imageops::FilterType::Triangle,
+            ResizeFilter::CatmullRom => image::imageops::FilterType::CatmullRom,
+            ResizeFilter::Gaussian => image::imageops::FilterType::Gaussian,
+            ResizeFilter::Lanczos3 => image::imageops::FilterType::Lanczos3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResizeSettings {
+    pub width: u32,
+    pub height: u32,
+    pub keep_aspect_ratio: bool,
+    pub filter: ResizeFilter,
+    pub only_shrink: bool,
+}
+
+impl Default for ResizeSettings {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            keep_aspect_ratio: true,
+            filter: ResizeFilter::Lanczos3,
+            only_shrink: false,
         }
     }
 }
@@ -148,9 +394,9 @@ impl Default for IcoSettings {
 pub struct ImageConverter {
     output_format: Format,
     compression: CompressionSettings,
-    target_width: u32,
-    target_height: u32,
-    keep_aspect_ratio: bool,
+    resize: Option<ResizeSettings>,
+    strip_metadata: bool,
+    enable_optimization: bool,
 }
 
 impl ImageConverter {
@@ -158,79 +404,86 @@ impl ImageConverter {
         Self {
             output_format,
             compression: CompressionSettings::default(),
-            target_width: 0,
-            target_height: 0,
-            keep_aspect_ratio: false,
+            resize: None,
+            strip_metadata: false,
+            enable_optimization: true,
         }
     }
-    
+    pub fn set_strip_metadata(&mut self, strip: bool) {
+        self.strip_metadata = strip;
+    }
+
+    pub fn set_enable_optimization(&mut self, enable: bool) {
+        self.enable_optimization = enable;
+    }
     pub fn with_compression(mut self, compression: CompressionSettings) -> Self {
         self.compression = compression;
         self
     }
     
-    pub fn with_target_size(mut self, width: u32, height: u32, keep_aspect_ratio: bool) -> Self {
-        self.target_width = width;
-        self.target_height = height;
-        self.keep_aspect_ratio = keep_aspect_ratio;
+    pub fn with_jpeg_settings(mut self, settings: JpegSettings) -> Self {
+        self.compression.jpeg = settings;
         self
     }
     
-    pub fn with_jpeg_quality(mut self, quality: u8) -> Result<Self> {
-        if quality == 0 || quality > 100 {
-            return Err(ConversionError::InvalidParameter(
-                "JPEG quality must be between 1 and 100".to_string()
-            ));
-        }
-        self.compression.jpeg_quality = quality;
-        Ok(self)
-    }
-    
-    pub fn with_png_compression(mut self, level: u8) -> Result<Self> {
-        if level > 9 {
-            return Err(ConversionError::InvalidParameter(
-                "PNG compression level must be between 0 and 9".to_string()
-            ));
-        }
-        self.compression.png_compression = level;
-        Ok(self)
-    }
-    
-    pub fn with_ico_settings(mut self, settings: IcoSettings) -> Self {
-        self.compression.ico_settings = settings;
+    pub fn with_png_settings(mut self, settings: PngSettings) -> Self {
+        self.compression.png = settings;
         self
     }
     
-    pub fn with_dds_mipmaps(mut self, mipmaps: bool) -> Self {
-        self.compression.dds_mipmaps = mipmaps;
+    pub fn with_webp_settings(mut self, settings: WebPSettings) -> Self {
+        self.compression.webp = settings;
+        self
+    }
+    
+    pub fn with_resize(mut self, settings: ResizeSettings) -> Self {
+        self.resize = Some(settings);
+        self
+    }
+    
+    pub fn strip_metadata(mut self, strip: bool) -> Self {
+        self.strip_metadata = strip;
+        self
+    }
+    
+    pub fn enable_optimization(mut self, enable: bool) -> Self {
+        self.enable_optimization = enable;
         self
     }
     
     fn resize_image(&self, img: DynamicImage) -> DynamicImage {
-        if self.target_width == 0 && self.target_height == 0 {
+        let Some(resize) = &self.resize else {
+            return img;
+        };
+        
+        if resize.width == 0 && resize.height == 0 {
             return img;
         }
         
-        if self.target_width == 0 || self.target_height == 0 {
-            let (width, height) = if self.target_width == 0 {
-                let new_height = self.target_height;
+        if resize.only_shrink && img.width() <= resize.width && img.height() <= resize.height {
+            return img;
+        }
+        
+        if resize.width == 0 || resize.height == 0 {
+            let (width, height) = if resize.width == 0 {
+                let new_height = resize.height;
                 let ratio = new_height as f32 / img.height() as f32;
                 let new_width = (img.width() as f32 * ratio).round() as u32;
                 (new_width, new_height)
             } else {
-                let new_width = self.target_width;
+                let new_width = resize.width;
                 let ratio = new_width as f32 / img.width() as f32;
                 let new_height = (img.height() as f32 * ratio).round() as u32;
                 (new_width, new_height)
             };
             
-            return img.resize(width, height, image::imageops::FilterType::Lanczos3);
+            return img.resize(width, height, resize.filter.to_image_filter());
         }
         
-        if self.keep_aspect_ratio {
-            img.resize(self.target_width, self.target_height, image::imageops::FilterType::Lanczos3)
+        if resize.keep_aspect_ratio {
+            img.resize(resize.width, resize.height, resize.filter.to_image_filter())
         } else {
-            img.resize_exact(self.target_width, self.target_height, image::imageops::FilterType::Lanczos3)
+            img.resize_exact(resize.width, resize.height, resize.filter.to_image_filter())
         }
     }
     
@@ -244,30 +497,16 @@ impl ImageConverter {
         let mut output = Cursor::new(Vec::new());
         
         match self.output_format {
-            Format::Png => {
-                self.encode_png(&img, &mut output)?;
-            }
-            Format::Jpeg => {
-                self.encode_jpeg(&img, &mut output)?;
-            }
-            Format::Ico => {
-                self.encode_ico(&img, &mut output)?;
-            }
-            Format::Tiff => {
-                self.encode_tiff(&img, &mut output)?;
-            }
-            Format::Bmp => {
-                self.encode_bmp(&img, &mut output)?;
-            }
-            Format::Dds => {
-                self.encode_dds(&img, &mut output)?;
-            }
-            Format::Hdr => {
-                self.encode_hdr(&img, &mut output)?;
-            }
-            Format::Farbfeld => {
-                self.encode_farbfeld(&img, &mut output)?;
-            }
+            Format::Png => self.encode_png(&img, &mut output)?,
+            Format::Jpeg => self.encode_jpeg_fast(&img, &mut output)?,
+            Format::Ico => self.encode_ico(&img, &mut output)?,
+            Format::Tiff => self.encode_tiff(&img, &mut output)?,
+            Format::Bmp => self.encode_bmp(&img, &mut output)?,
+            Format::Dds => self.encode_dds(&img, &mut output)?,
+            Format::Hdr => self.encode_hdr(&img, &mut output)?,
+            Format::Farbfeld => self.encode_farbfeld(&img, &mut output)?,
+            Format::WebP => self.encode_webp(&img, &mut output)?,
+            Format::Gif => self.encode_gif(&img, &mut output)?,
             _ => {
                 img.write_to(&mut output, self.output_format.to_image_format())?;
             }
@@ -276,39 +515,110 @@ impl ImageConverter {
         Ok(output.into_inner())
     }
     
+    fn encode_jpeg_fast(&self, img: &DynamicImage, output: &mut Cursor<Vec<u8>>) -> Result<()> {
+        let settings = &self.compression.jpeg;
+
+        if settings.quality == 0 || settings.quality > 100 {
+            return Err(ConversionError::InvalidParameter(
+                "JPEG quality must be between 1 and 100".to_string()
+            ));
+        }
+
+        let rgb_img = img.to_rgb8();
+        let width = rgb_img.width();
+        let height = rgb_img.height();
+        let pixels = rgb_img.into_raw();
+
+        let mut comp = Compress::new(MozColorSpace::JCS_RGB);
+        comp.set_size(width as usize, height as usize);
+        comp.set_quality(settings.quality as f32);
+
+        if settings.progressive {
+            comp.set_scan_optimization_mode(ScanMode::AllComponentsTogether);
+            comp.set_progressive_mode();
+        }
+        if settings.smoothing > 0 {
+            comp.set_smoothing_factor(settings.smoothing as u8);
+        }
+
+        match settings.optimization {
+            JpegOptimization::Speed => comp.set_optimize_coding(false),
+            JpegOptimization::Balanced | JpegOptimization::Size | JpegOptimization::Quality => {
+                comp.set_optimize_coding(true);
+            }
+        }
+        let mut writer = output;
+        let mut started = comp.start_compress(&mut writer)
+            .map_err(|e| ConversionError::JpegError(format!("MozJPEG start_compress failed: {}", e)))?;
+
+        let row_stride = width as usize * 3;
+        for y in 0..height as usize {
+            let row = &pixels[y * row_stride..(y + 1) * row_stride];
+            started.write_scanlines(row)
+                .map_err(|e| ConversionError::JpegError(format!("MozJPEG write_scanlines failed: {}", e)))?;
+        }
+
+        let _ = started.finish()
+            .map_err(|e| ConversionError::JpegError(format!("MozJPEG finish failed: {}", e)))?;
+
+        Ok(())
+    }
+    
     fn encode_png(&self, img: &DynamicImage, output: &mut Cursor<Vec<u8>>) -> Result<()> {
+        let settings = &self.compression.png;
+        
+        let compression_type = match settings.compression_type {
+            PngCompressionType::Fast => CompressionType::Fast,
+            PngCompressionType::Default => CompressionType::Default,
+            PngCompressionType::Best => CompressionType::Best,
+            #[allow(deprecated)]
+            PngCompressionType::Huffman => CompressionType::Huffman,
+        };
+        
         let encoder = PngEncoder::new_with_quality(
             output,
-            match self.compression.png_compression {
-                0..=1 => CompressionType::Fast,
-                2..=5 => CompressionType::Default,
-                _ => CompressionType::Best,
-            },
-            self.compression.png_filter.to_filter_type(),
+            compression_type,
+            settings.filter.to_filter_type(),
         );
         
         img.write_with_encoder(encoder)?;
         Ok(())
     }
     
-    fn encode_jpeg(&self, img: &DynamicImage, output: &mut Cursor<Vec<u8>>) -> Result<()> {
-        let mut encoder = JpegEncoder::new_with_quality(
-            output,
-            self.compression.jpeg_quality,
-        );
+    #[cfg(feature = "webp-encoding")]
+    fn encode_webp(&self, img: &DynamicImage, output: &mut Cursor<Vec<u8>>) -> Result<()> {
+        let settings = &self.compression.webp;
         
-        let rgb_img = img.to_rgb8();
-        encoder.encode(
-            rgb_img.as_raw(),
-            rgb_img.width(),
-            rgb_img.height(),
-            ColorType::Rgb8,
-        )?;
+        let rgba_img = img.to_rgba8();
+        let width = rgba_img.width();
+        let height = rgba_img.height();
+        let pixels = rgba_img.as_raw();
+        
+        let encoded = if settings.lossless {
+            webp::Encoder::from_rgba(pixels, width, height)
+                .encode_lossless()
+        } else {
+            webp::Encoder::from_rgba(pixels, width, height)
+                .encode(settings.quality)
+        };
+        
+        output.write_all(&encoded)?;
+        Ok(())
+    }
+    
+    #[cfg(not(feature = "webp-encoding"))]
+    fn encode_webp(&self, img: &DynamicImage, output: &mut Cursor<Vec<u8>>) -> Result<()> {
+        img.write_to(output, ImageFormat::WebP)?;
+        Ok(())
+    }
+    
+    fn encode_gif(&self, img: &DynamicImage, output: &mut Cursor<Vec<u8>>) -> Result<()> {
+        img.write_to(output, ImageFormat::Gif)?;
         Ok(())
     }
     
     fn encode_ico(&self, img: &DynamicImage, output: &mut Cursor<Vec<u8>>) -> Result<()> {
-        let settings = &self.compression.ico_settings;
+        let settings = &self.compression.ico;
         
         let max_dim = settings.max_dimension;
         let resized = if img.width() > max_dim || img.height() > max_dim {
@@ -318,7 +628,6 @@ impl ImageConverter {
         };
         
         let rgba_img = resized.to_rgba8();
-        
         let encoder = IcoEncoder::new(output);
         
         encoder.write_image(
@@ -344,22 +653,39 @@ impl ImageConverter {
     }
     
     fn encode_dds(&self, img: &DynamicImage, output: &mut Cursor<Vec<u8>>) -> Result<()> {
+        let settings = &self.compression.dds;
+        
         let rgba_img = img.to_rgba8();
         let width = rgba_img.width();
         let height = rgba_img.height();
         let raw_data = rgba_img.into_raw();
 
+        let dxgi_format = match settings.format {
+            DdsFormat::RGBA8 => DxgiFormat::R8G8B8A8_UNorm,
+            DdsFormat::BC1 => DxgiFormat::BC1_UNorm,
+            DdsFormat::BC2 => DxgiFormat::BC2_UNorm,
+            DdsFormat::BC3 => DxgiFormat::BC3_UNorm,
+            DdsFormat::BC4 => DxgiFormat::BC4_UNorm,
+            DdsFormat::BC5 => DxgiFormat::BC5_UNorm,
+            DdsFormat::BC6H => DxgiFormat::BC6H_UF16,
+            DdsFormat::BC7 => DxgiFormat::BC7_UNorm,
+        };
+
         let params = NewDxgiParams {
             width,
             height,
-            format: DxgiFormat::R8G8B8A8_UNorm,
-            mipmap_levels: if self.compression.dds_mipmaps { Some(0) } else { None },
+            format: dxgi_format,
+            mipmap_levels: if settings.generate_mipmaps { 
+                Some(if settings.mipmap_count > 0 { settings.mipmap_count } else { 0 })
+            } else { 
+                None 
+            },
             array_layers: Some(1),
             caps2: Some(Caps2::empty()),
             alpha_mode: AlphaMode::Straight,
             resource_dimension: D3D10ResourceDimension::Texture2D,
             depth: Some(1),
-            is_cubemap: false,
+            is_cubemap: settings.is_cubemap,
         };
 
         let mut dds = Dds::new_dxgi(params)
@@ -421,40 +747,6 @@ impl ImageConverter {
         
         Ok(())
     }
-    
-    pub fn convert_with_format(
-        input_data: &[u8],
-        output_format: Format,
-        compression: Option<CompressionSettings>,
-    ) -> Result<Vec<u8>> {
-        let mut converter = Self::new(output_format);
-        if let Some(comp) = compression {
-            converter = converter.with_compression(comp);
-        }
-        converter.convert(input_data)
-    }
-    
-    pub fn get_image_info(input_data: &[u8]) -> Result<ImageInfo> {
-        let img = image::load_from_memory(input_data)?;
-        
-        Ok(ImageInfo {
-            width: img.width(),
-            height: img.height(),
-            color_type: match img.color() {
-                ColorType::L8 => ImageColorType::Grayscale,
-                ColorType::La8 => ImageColorType::GrayscaleAlpha,
-                ColorType::Rgb8 => ImageColorType::Rgb,
-                ColorType::Rgba8 => ImageColorType::Rgba,
-                ColorType::L16 => ImageColorType::Grayscale16,
-                ColorType::La16 => ImageColorType::GrayscaleAlpha16,
-                ColorType::Rgb16 => ImageColorType::Rgb16,
-                ColorType::Rgba16 => ImageColorType::Rgba16,
-                ColorType::Rgb32F => ImageColorType::Rgb32F,
-                ColorType::Rgba32F => ImageColorType::Rgba32F,
-                _ => ImageColorType::Unknown,
-            },
-        })
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -481,375 +773,27 @@ pub enum ImageColorType {
     Unknown,
 }
 
-#[repr(C)]
-pub struct RawPixels {
-    pub data: *mut u8,
-    pub len: usize,
-    pub capacity: usize,
-    pub width: u32,
-    pub height: u32,
-    pub channels: u32,
-    pub color_type: ImageColorType,
-}
-
-impl RawPixels {
-    pub fn new(data: Vec<u8>, width: u32, height: u32, channels: u32, color_type: ImageColorType) -> Self {
-        let len = data.len();
-        let capacity = data.capacity();
-        let data_ptr = data.as_ptr() as *mut u8;
-        std::mem::forget(data);
+impl ImageConverter {
+    pub fn get_image_info(input_data: &[u8]) -> Result<ImageInfo> {
+        let img = image::load_from_memory(input_data)?;
         
-        Self {
-            data: data_ptr,
-            len,
-            capacity,
-            width,
-            height,
-            channels,
-            color_type,
-        }
-    }
-}
-
-pub fn free_raw_pixels(pixels: RawPixels) {
-    if !pixels.data.is_null() {
-        unsafe {
-            Vec::from_raw_parts(pixels.data, pixels.len, pixels.capacity);
-        }
-    }
-}
-
-pub fn to_bitmap(input_data: &[u8]) -> Result<Vec<u8>> {
-    let converter = ImageConverter::new(Format::Bmp);
-    converter.convert(input_data)
-}
-
-pub fn get_raw_pixels(input_data: &[u8]) -> Result<RawPixels> {
-    let img = image::load_from_memory(input_data)?;
-    
-    match img.color() {
-        ColorType::L8 | ColorType::L16 => {
-            let gray_img = img.to_luma8();
-            let width = gray_img.width();
-            let height = gray_img.height();
-            let data = gray_img.into_raw();
-            
-            let color_type = match img.color() {
+        Ok(ImageInfo {
+            width: img.width(),
+            height: img.height(),
+            color_type: match img.color() {
                 ColorType::L8 => ImageColorType::Grayscale,
-                ColorType::L16 => ImageColorType::Grayscale16,
-                _ => ImageColorType::Grayscale,
-            };
-            
-            Ok(RawPixels::new(data, width, height, 1, color_type))
-        }
-        ColorType::La8 | ColorType::La16 => {
-            let gray_alpha_img = img.to_luma_alpha8();
-            let width = gray_alpha_img.width();
-            let height = gray_alpha_img.height();
-            let data = gray_alpha_img.into_raw();
-            
-            let color_type = match img.color() {
                 ColorType::La8 => ImageColorType::GrayscaleAlpha,
-                ColorType::La16 => ImageColorType::GrayscaleAlpha16,
-                _ => ImageColorType::GrayscaleAlpha,
-            };
-            
-            Ok(RawPixels::new(data, width, height, 2, color_type))
-        }
-        ColorType::Rgb8 | ColorType::Rgb16 | ColorType::Rgb32F => {
-            let rgb_img = img.to_rgb8();
-            let width = rgb_img.width();
-            let height = rgb_img.height();
-            let data = rgb_img.into_raw();
-            
-            let color_type = match img.color() {
                 ColorType::Rgb8 => ImageColorType::Rgb,
-                ColorType::Rgb16 => ImageColorType::Rgb16,
-                ColorType::Rgb32F => ImageColorType::Rgb32F,
-                _ => ImageColorType::Rgb,
-            };
-            
-            Ok(RawPixels::new(data, width, height, 3, color_type))
-        }
-        ColorType::Rgba8 | ColorType::Rgba16 | ColorType::Rgba32F => {
-            let rgba_img = img.to_rgba8();
-            let width = rgba_img.width();
-            let height = rgba_img.height();
-            let data = rgba_img.into_raw();
-            
-            let color_type = match img.color() {
                 ColorType::Rgba8 => ImageColorType::Rgba,
+                ColorType::L16 => ImageColorType::Grayscale16,
+                ColorType::La16 => ImageColorType::GrayscaleAlpha16,
+                ColorType::Rgb16 => ImageColorType::Rgb16,
                 ColorType::Rgba16 => ImageColorType::Rgba16,
+                ColorType::Rgb32F => ImageColorType::Rgb32F,
                 ColorType::Rgba32F => ImageColorType::Rgba32F,
-                _ => ImageColorType::Rgba,
-            };
-            
-            Ok(RawPixels::new(data, width, height, 4, color_type))
-        }
-        _ => {
-            let rgba_img = img.to_rgba8();
-            let width = rgba_img.width();
-            let height = rgba_img.height();
-            let data = rgba_img.into_raw();
-            
-            Ok(RawPixels::new(data, width, height, 4, ImageColorType::Rgba))
-        }
-    }
-}
-
-pub mod ffi {
-    use super::*;
-    use std::slice;
-    use std::ptr;
-    
-    #[repr(C)]
-    pub struct ImageData {
-        data: *mut u8,
-        len: usize,
-        capacity: usize,
-    }
-    
-    #[repr(C)]
-    pub enum ResultCode {
-        Success = 0,
-        ErrorInvalidFormat = 1,
-        ErrorImageProcessing = 2,
-        ErrorEncoding = 3,
-        ErrorInvalidParameter = 4,
-        ErrorNullPointer = 5,
-        ErrorUnsupportedOperation = 6,
-        ErrorDds = 7,
-        ErrorFarbfeld = 8,
-    }
-    
-    #[repr(C)]
-    pub struct CImageInfo {
-        pub width: u32,
-        pub height: u32,
-        pub color_type: ImageColorType,
-    }
-    
-    #[no_mangle]
-    pub extern "C" fn image_data_free(img: *mut ImageData) {
-        if img.is_null() {
-            return;
-        }
-        
-        unsafe {
-            let img = Box::from_raw(img);
-            if !img.data.is_null() {
-                Vec::from_raw_parts(img.data, img.len, img.capacity);
-            }
-        }
-    }
-
-    #[no_mangle]
-    pub unsafe extern "C" fn image_convert_advanced(
-        input_data: *const u8,
-        input_len: usize,
-        output_format: Format,
-        jpeg_quality: u8,
-        png_compression: u8,
-        png_filter: PngFilterType,
-        ico_max_dimension: u32,
-        ico_generate_multiple: bool,
-        dds_mipmaps: bool,
-        target_width: u32,
-        target_height: u32,
-        keep_aspect_ratio: bool,
-        output: *mut *mut ImageData,
-    ) -> ResultCode {
-        if input_data.is_null() || output.is_null() {
-            return ResultCode::ErrorNullPointer;
-        }
-        
-        let input_slice = slice::from_raw_parts(input_data, input_len);
-        
-        let compression = CompressionSettings {
-            jpeg_quality: if jpeg_quality == 0 { 90 } else { jpeg_quality },
-            png_compression: if png_compression > 9 { 6 } else { png_compression },
-            png_filter,
-            ico_settings: IcoSettings {
-                max_dimension: if ico_max_dimension == 0 { 256 } else { ico_max_dimension },
-                generate_multiple_sizes: ico_generate_multiple,
+                _ => ImageColorType::Unknown,
             },
-            dds_mipmaps,
-        };
-        
-        let converter = ImageConverter::new(output_format)
-            .with_compression(compression)
-            .with_target_size(target_width, target_height, keep_aspect_ratio);
-        
-        match converter.convert(input_slice) {
-            Ok(mut result) => {
-                let len = result.len();
-                let capacity = result.capacity();
-                let data = result.as_mut_ptr();
-                std::mem::forget(result);
-                
-                let image_data = Box::new(ImageData {
-                    data,
-                    len,
-                    capacity,
-                });
-                
-                *output = Box::into_raw(image_data);
-                ResultCode::Success
-            }
-            Err(e) => match e {
-                ConversionError::InvalidFormat => ResultCode::ErrorInvalidFormat,
-                ConversionError::InvalidParameter(_) => ResultCode::ErrorInvalidParameter,
-                ConversionError::EncodingError(_) => ResultCode::ErrorEncoding,
-                ConversionError::ImageError(_) => ResultCode::ErrorImageProcessing,
-                ConversionError::UnsupportedOperation(_) => ResultCode::ErrorUnsupportedOperation,
-                ConversionError::DdsError(_) => ResultCode::ErrorDds,
-                ConversionError::FarbfeldError(_) => ResultCode::ErrorFarbfeld,
-                ConversionError::IoError(_) => ResultCode::ErrorEncoding,
-            }
-        }
-    }
-    
-    #[no_mangle]
-    pub unsafe extern "C" fn image_convert(
-        input_data: *const u8,
-        input_len: usize,
-        output_format: Format,
-        jpeg_quality: u8,
-        png_compression: u8,
-        png_filter: PngFilterType,
-        output: *mut *mut ImageData,
-    ) -> ResultCode {
-        image_convert_advanced(
-            input_data,
-            input_len,
-            output_format,
-            jpeg_quality,
-            png_compression,
-            png_filter,
-            256,
-            false,
-            true,
-            0,  // target_width
-            0,  // target_height
-            false, // keep_aspect_ratio
-            output,
-        )
-    }
-    
-    #[no_mangle]
-    pub unsafe extern "C" fn image_get_info(
-        input_data: *const u8,
-        input_len: usize,
-        info: *mut CImageInfo,
-    ) -> ResultCode {
-        if input_data.is_null() || info.is_null() {
-            return ResultCode::ErrorNullPointer;
-        }
-        
-        let input_slice = slice::from_raw_parts(input_data, input_len);
-        
-        match ImageConverter::get_image_info(input_slice) {
-            Ok(image_info) => {
-                *info = CImageInfo {
-                    width: image_info.width,
-                    height: image_info.height,
-                    color_type: image_info.color_type,
-                };
-                ResultCode::Success
-            }
-            Err(_) => ResultCode::ErrorImageProcessing,
-        }
-    }
-    
-    #[no_mangle]
-    pub unsafe extern "C" fn image_data_get_ptr(img: *const ImageData) -> *const u8 {
-        if img.is_null() {
-            return ptr::null();
-        }
-        (*img).data
-    }
-    
-    #[no_mangle]
-    pub unsafe extern "C" fn image_data_get_len(img: *const ImageData) -> usize {
-        if img.is_null() {
-            return 0;
-        }
-        (*img).len
-    }
-    
-    #[no_mangle]
-    pub unsafe extern "C" fn image_get_raw_pixels(
-        input_data: *const u8,
-        input_len: usize,
-        raw_pixels: *mut RawPixels,
-    ) -> ResultCode {
-        if input_data.is_null() || raw_pixels.is_null() {
-            return ResultCode::ErrorNullPointer;
-        }
-        
-        let input_slice = slice::from_raw_parts(input_data, input_len);
-        
-        match get_raw_pixels(input_slice) {
-            Ok(pixels) => {
-                *raw_pixels = pixels;
-                ResultCode::Success
-            }
-            Err(e) => match e {
-                ConversionError::InvalidFormat => ResultCode::ErrorInvalidFormat,
-                ConversionError::InvalidParameter(_) => ResultCode::ErrorInvalidParameter,
-                ConversionError::EncodingError(_) => ResultCode::ErrorEncoding,
-                ConversionError::ImageError(_) => ResultCode::ErrorImageProcessing,
-                ConversionError::UnsupportedOperation(_) => ResultCode::ErrorUnsupportedOperation,
-                ConversionError::DdsError(_) => ResultCode::ErrorDds,
-                ConversionError::FarbfeldError(_) => ResultCode::ErrorFarbfeld,
-                ConversionError::IoError(_) => ResultCode::ErrorEncoding,
-            }
-        }
-    }
-    
-    #[no_mangle]
-    pub extern "C" fn raw_pixels_free(pixels: RawPixels) {
-        free_raw_pixels(pixels);
-    }
-    
-    #[no_mangle]
-    pub unsafe extern "C" fn raw_pixels_get_data(pixels: *const RawPixels) -> *const u8 {
-        if pixels.is_null() {
-            return ptr::null();
-        }
-        (*pixels).data
-    }
-    
-    #[no_mangle]
-    pub unsafe extern "C" fn raw_pixels_get_width(pixels: *const RawPixels) -> u32 {
-        if pixels.is_null() {
-            return 0;
-        }
-        (*pixels).width
-    }
-    
-    #[no_mangle]
-    pub unsafe extern "C" fn raw_pixels_get_height(pixels: *const RawPixels) -> u32 {
-        if pixels.is_null() {
-            return 0;
-        }
-        (*pixels).height
-    }
-    
-    #[no_mangle]
-    pub unsafe extern "C" fn raw_pixels_get_channels(pixels: *const RawPixels) -> u32 {
-        if pixels.is_null() {
-            return 0;
-        }
-        (*pixels).channels
-    }
-    
-    #[no_mangle]
-    pub unsafe extern "C" fn raw_pixels_get_len(pixels: *const RawPixels) -> usize {
-        if pixels.is_null() {
-            return 0;
-        }
-        (*pixels).len
+        })
     }
 }
 
@@ -857,128 +801,80 @@ pub mod ffi {
 mod tests {
     use super::*;
     
-    #[test]
-    fn test_basic_conversion() {
-        let png_data = vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
-            0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,
-            0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
-            0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
-            0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
-            0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
-        
-        let converter = ImageConverter::new(Format::Jpeg);
-        let result = converter.convert(&png_data);
-        assert!(result.is_ok());
+    fn create_test_image() -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(100, 100, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        }))
     }
     
     #[test]
-    fn test_to_bitmap() {
-        let png_data = vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
-            0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,
-            0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
-            0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
-            0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
-            0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
+    fn test_fast_jpeg_encoding() {
+        let img = create_test_image();
         
-        let result = to_bitmap(&png_data);
+        let converter = ImageConverter::new(Format::Jpeg)
+            .with_jpeg_settings(JpegSettings {
+                quality: 95,
+                progressive: true,
+                optimization: JpegOptimization::Quality,
+                ..Default::default()
+            });
+        
+        let result = converter.convert_image(&img);
         assert!(result.is_ok());
         
-        let bitmap_data = result.unwrap();
-
-        assert!(bitmap_data.len() > 2);
-        assert_eq!(bitmap_data[0], b'B');
-        assert_eq!(bitmap_data[1], b'M');
+        let data = result.unwrap();
+        assert!(data.len() > 0);
+        assert_eq!(&data[0..2], &[0xFF, 0xD8]);
     }
     
     #[test]
-    fn test_get_raw_pixels() {
-        let png_data = vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
-            0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,
-            0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
-            0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
-            0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
-            0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
-        
-        let result = get_raw_pixels(&png_data);
-        assert!(result.is_ok());
-        
-        let pixels = result.unwrap();
-
-        assert!(pixels.len > 0);
-        assert_eq!(pixels.width, 1);
-        assert_eq!(pixels.height, 1);
-        assert!(pixels.channels == 3 || pixels.channels == 4);
-
-        free_raw_pixels(pixels);
-    }
-    
-    #[test]
-    fn test_dds_conversion() {
-        let test_data = vec![0; 100];
-        let converter = ImageConverter::new(Format::Dds);
-        let result = converter.convert(&test_data);
-        assert!(result.is_err());
-    }
-    
-    #[test]
-    fn test_farbfeld_conversion() {
-        let test_data = vec![0; 100];
-        let converter = ImageConverter::new(Format::Farbfeld);
-        let result = converter.convert(&test_data);
-        assert!(result.is_err());
-    }
-    
-    #[test]
-    fn test_resize_logic() {
-        let png_data = vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-            0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x10,
-            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
-            0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,
-            0x54, 0x28, 0x91, 0x63, 0x60, 0x60, 0x60, 0x60,
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x28, 0xAE,
-            0x0F, 0x20, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
-            0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
-        
-        let converter = ImageConverter::new(Format::Png);
-        let result = converter.convert(&png_data);
-        assert!(result.is_ok());
+    fn test_png_advanced() {
+        let img = create_test_image();
         
         let converter = ImageConverter::new(Format::Png)
-            .with_target_size(50, 50, false);
-        let result = converter.convert(&png_data);
+            .with_png_settings(PngSettings {
+                compression_level: 9,
+                compression_type: PngCompressionType::Best,
+                filter: PngFilterType::Adaptive,
+                interlaced: false,
+                strip_metadata: true,
+                bit_depth: 8,
+            });
+        
+        let result = converter.convert_image(&img);
         assert!(result.is_ok());
+    }
+    
+    #[test]
+    fn test_resize_with_filter() {
+        let img = create_test_image();
         
         let converter = ImageConverter::new(Format::Png)
-            .with_target_size(50, 0, false);
-        let result = converter.convert(&png_data);
-        assert!(result.is_ok());
+            .with_resize(ResizeSettings {
+                width: 50,
+                height: 50,
+                keep_aspect_ratio: false,
+                filter: ResizeFilter::Lanczos3,
+                only_shrink: false,
+            });
         
-        let converter = ImageConverter::new(Format::Png)
-            .with_target_size(0, 50, false);
-        let result = converter.convert(&png_data);
+        let result = converter.convert_image(&img);
         assert!(result.is_ok());
+    }
+    
+    #[test]
+    fn test_jpeg_quality_settings() {
+        let img = create_test_image();
         
-        let converter = ImageConverter::new(Format::Png)
-            .with_target_size(50, 100, true);
-        let result = converter.convert(&png_data);
-        assert!(result.is_ok());
+        for quality in [75, 85, 95].iter() {
+            let converter = ImageConverter::new(Format::Jpeg)
+                .with_jpeg_settings(JpegSettings {
+                    quality: *quality,
+                    ..Default::default()
+                });
+            
+            let result = converter.convert_image(&img);
+            assert!(result.is_ok());
+        }
     }
 }
