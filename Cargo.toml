@@ -6,6 +6,7 @@ authors = ["RYBYTE", "Rybitva Danil Andreevich"]
 license = "PolyForm Noncommercial 1.0.0"
 repository = "https://github.com/RyByteDev/librybyte_image_converter"
 homepage = "https://rybyte.ru"
+build = "build.rs"
 
 [dependencies]
 image = { version = "0.24", features = ["jpeg", "png", "gif", "bmp", "ico", "tiff", "webp", "hdr", "tga", "dds", "farbfeld"] }
