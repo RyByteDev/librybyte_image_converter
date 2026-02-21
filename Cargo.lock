@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "rybyte_image_converter"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "ddsfile",
  "gif 0.12.0",

@@ -1,18 +1,20 @@
 [package]
 name = "rybyte_image_converter"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 authors = ["RYBYTE", "Rybitva Danil Andreevich"]
 license = "PolyForm Noncommercial 1.0.0"
+repository = "https://github.com/RyByteDev/librybyte_image_converter"
+homepage = "https://rybyte.ru"
 
 [dependencies]
-image = "0.24"
+image = { version = "0.24", features = ["jpeg", "png", "gif", "bmp", "ico", "tiff", "webp", "hdr", "tga", "dds", "farbfeld"] }
 mozjpeg = { version = "0.10", optional = true }
 webp = { version = "0.2", optional = true }
 gif = "0.12"
 ddsfile = "0.5"
 thiserror = "1.0"
-rayon = "1.7"
+rayon = "1.8"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -23,8 +25,13 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+overflow-checks = false
+
+[profile.release.package."*"]
+opt-level = 3
 
 [features]
-default = ["webp-encoding", "fast-jpeg"]
+default = ["webp-encoding", "fast-jpeg", "parallel"]
 webp-encoding = ["webp"]
 fast-jpeg = ["mozjpeg"]
+parallel = []

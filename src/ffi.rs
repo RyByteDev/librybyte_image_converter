@@ -3,6 +3,7 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_uchar, c_uint, c_ushort};
 use std::ptr;
 use std::slice;
+use std::sync::{Arc, Mutex};
 use crate::ConversionError;
 
 use crate::{
@@ -25,19 +26,20 @@ use crate::{
     GifSettings,
     DdsSettings,
     DdsFormat,
+    ParallelConfig,
 };
-
-
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = RefCell::new(None);
 }
+
 fn set_last_error(err: impl Into<String>) {
     let s = CString::new(err.into()).unwrap_or_else(|_| CString::new("unknown").unwrap());
     LAST_ERROR.with(|c| {
         *c.borrow_mut() = Some(s);
     })
 }
+
 #[no_mangle]
 pub extern "C" fn ffi_get_last_error() -> *const c_char {
     LAST_ERROR.with(|c| match &*c.borrow() {
@@ -45,6 +47,7 @@ pub extern "C" fn ffi_get_last_error() -> *const c_char {
         None => ptr::null(),
     })
 }
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub enum FfiErrorCode {
@@ -74,10 +77,15 @@ impl From<&crate::ConversionError> for FfiErrorCode {
         }
     }
 }
+
 #[repr(C)]
 pub struct FfiImageConverter {
-    inner: *mut ImageConverter,
+    inner: Arc<Mutex<ImageConverter>>,
 }
+
+unsafe impl Send for FfiImageConverter {}
+unsafe impl Sync for FfiImageConverter {}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub enum FfiFormat {
@@ -113,6 +121,7 @@ impl From<FfiFormat> for Format {
         }
     }
 }
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct FfiJpegSettings {
@@ -155,6 +164,7 @@ impl From<FfiJpegSettings> for JpegSettings {
         }
     }
 }
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct FfiPngSettings {
@@ -196,6 +206,7 @@ impl From<FfiPngSettings> for PngSettings {
         }
     }
 }
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct FfiResizeSettings {
@@ -226,6 +237,27 @@ impl From<FfiResizeSettings> for ResizeSettings {
         }
     }
 }
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct FfiParallelConfig {
+    pub tile_size: c_uint,
+    pub enable_tiling: c_uchar,
+    pub min_size_for_parallel: c_uint,
+    pub thread_count: usize,
+}
+
+impl From<FfiParallelConfig> for ParallelConfig {
+    fn from(c: FfiParallelConfig) -> Self {
+        ParallelConfig {
+            tile_size: c.tile_size,
+            enable_tiling: c.enable_tiling != 0,
+            min_size_for_parallel: c.min_size_for_parallel,
+            thread_count: c.thread_count,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct FfiImageInfo {
@@ -233,27 +265,47 @@ pub struct FfiImageInfo {
     pub height: c_uint,
     pub color_type: c_uint,
 }
+
 #[no_mangle]
 pub extern "C" fn ffi_image_converter_new(format: FfiFormat) -> *mut FfiImageConverter {
     let rust_format: Format = format.into();
     let conv = ImageConverter::new(rust_format);
-    let boxed = Box::new(FfiImageConverter {
-        inner: Box::into_raw(Box::new(conv)),
-    });
-    Box::into_raw(boxed)
+    
+    Box::into_raw(Box::new(FfiImageConverter {
+        inner: Arc::new(Mutex::new(conv)),
+    }))
 }
+
 #[no_mangle]
 pub extern "C" fn ffi_image_converter_free(handle: *mut FfiImageConverter) {
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        let boxed = Box::from_raw(handle);
-        if !boxed.inner.is_null() {
-            let _ = Box::from_raw(boxed.inner);
+    if !handle.is_null() {
+        unsafe {
+            let _ = Box::from_raw(handle);
         }
     }
 }
+
+#[no_mangle]
+pub extern "C" fn ffi_image_converter_set_parallel_config(
+    handle: *mut FfiImageConverter,
+    config: FfiParallelConfig,
+) -> FfiErrorCode {
+    if handle.is_null() {
+        set_last_error("Null converter handle");
+        return FfiErrorCode::InvalidParameter;
+    }
+
+    unsafe {
+        if let Ok(mut conv) = (*handle).inner.lock() {
+            conv.set_parallel_config(config.into());
+            FfiErrorCode::Success
+        } else {
+            set_last_error("Failed to lock converter");
+            FfiErrorCode::Unknown
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn ffi_image_converter_set_jpeg_settings(
     handle: *mut FfiImageConverter,
@@ -263,12 +315,18 @@ pub extern "C" fn ffi_image_converter_set_jpeg_settings(
         set_last_error("Null converter handle");
         return FfiErrorCode::InvalidParameter;
     }
+
     unsafe {
-        let conv = &mut *(*handle).inner;
-        conv.compression.jpeg = settings.into();
-        FfiErrorCode::Success
+        if let Ok(mut conv) = (*handle).inner.lock() {
+            conv.compression.jpeg = settings.into();
+            FfiErrorCode::Success
+        } else {
+            set_last_error("Failed to lock converter");
+            FfiErrorCode::Unknown
+        }
     }
 }
+
 #[no_mangle]
 pub extern "C" fn ffi_image_converter_set_png_settings(
     handle: *mut FfiImageConverter,
@@ -278,12 +336,18 @@ pub extern "C" fn ffi_image_converter_set_png_settings(
         set_last_error("Null converter handle");
         return FfiErrorCode::InvalidParameter;
     }
+
     unsafe {
-        let conv = &mut *(*handle).inner;
-        conv.compression.png = settings.into();
-        FfiErrorCode::Success
+        if let Ok(mut conv) = (*handle).inner.lock() {
+            conv.compression.png = settings.into();
+            FfiErrorCode::Success
+        } else {
+            set_last_error("Failed to lock converter");
+            FfiErrorCode::Unknown
+        }
     }
 }
+
 #[no_mangle]
 pub extern "C" fn ffi_image_converter_set_resize(
     handle: *mut FfiImageConverter,
@@ -293,12 +357,18 @@ pub extern "C" fn ffi_image_converter_set_resize(
         set_last_error("Null converter handle");
         return FfiErrorCode::InvalidParameter;
     }
+
     unsafe {
-        let conv = &mut *(*handle).inner;
-        conv.resize = Some(settings.into());
-        FfiErrorCode::Success
+        if let Ok(mut conv) = (*handle).inner.lock() {
+            conv.resize = Some(settings.into());
+            FfiErrorCode::Success
+        } else {
+            set_last_error("Failed to lock converter");
+            FfiErrorCode::Unknown
+        }
     }
 }
+
 #[no_mangle]
 pub extern "C" fn ffi_image_converter_strip_metadata(
     handle: *mut FfiImageConverter,
@@ -308,12 +378,18 @@ pub extern "C" fn ffi_image_converter_strip_metadata(
         set_last_error("Null converter handle");
         return FfiErrorCode::InvalidParameter;
     }
+
     unsafe {
-        let conv = &mut *(*handle).inner;
-        conv.set_strip_metadata(strip != 0);
-        FfiErrorCode::Success
+        if let Ok(mut conv) = (*handle).inner.lock() {
+            conv.set_strip_metadata(strip != 0);
+            FfiErrorCode::Success
+        } else {
+            set_last_error("Failed to lock converter");
+            FfiErrorCode::Unknown
+        }
     }
 }
+
 #[no_mangle]
 pub extern "C" fn ffi_image_converter_enable_optimization(
     handle: *mut FfiImageConverter,
@@ -323,12 +399,18 @@ pub extern "C" fn ffi_image_converter_enable_optimization(
         set_last_error("Null converter handle");
         return FfiErrorCode::InvalidParameter;
     }
+
     unsafe {
-        let conv = &mut *(*handle).inner;
-        conv.set_enable_optimization(enable != 0);
-        FfiErrorCode::Success
+        if let Ok(mut conv) = (*handle).inner.lock() {
+            conv.set_enable_optimization(enable != 0);
+            FfiErrorCode::Success
+        } else {
+            set_last_error("Failed to lock converter");
+            FfiErrorCode::Unknown
+        }
     }
 }
+
 #[no_mangle]
 pub extern "C" fn ffi_image_converter_convert_memory(
     handle: *mut FfiImageConverter,
@@ -337,33 +419,39 @@ pub extern "C" fn ffi_image_converter_convert_memory(
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
 ) -> FfiErrorCode {
-    if handle.is_null() {
-        set_last_error("Null converter handle");
-        return FfiErrorCode::InvalidParameter;
-    }
-    if input_ptr.is_null() || input_len == 0 || out_ptr.is_null() || out_len.is_null() {
-        set_last_error("Invalid pointer/length passed");
+    if handle.is_null() || input_ptr.is_null() || input_len == 0 || out_ptr.is_null() || out_len.is_null() {
+        set_last_error("Invalid parameters");
         return FfiErrorCode::InvalidParameter;
     }
 
     unsafe {
         let input_slice = slice::from_raw_parts(input_ptr, input_len);
 
-        let conv = &*(*handle).inner;
+        let conv = match (*handle).inner.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                set_last_error("Failed to lock converter");
+                return FfiErrorCode::Unknown;
+            }
+        };
+
         match conv.convert(input_slice) {
-            Ok(vec) => {
+            Ok(mut vec) => {
+                vec.shrink_to_fit();
                 let size = vec.len();
+
                 if size == 0 {
                     *out_ptr = ptr::null_mut();
                     *out_len = 0;
                     return FfiErrorCode::Success;
                 }
-                let mut buf = Vec::<u8>::with_capacity(size as usize);
-                let mem = buf.as_mut_ptr();
-                std::mem::forget(buf);
-                ptr::copy_nonoverlapping(vec.as_ptr(), mem, size);
+
+                let mem = vec.as_mut_ptr();
+                std::mem::forget(vec);
+
                 *out_ptr = mem;
                 *out_len = size;
+
                 FfiErrorCode::Success
             }
             Err(e) => {
@@ -373,16 +461,94 @@ pub extern "C" fn ffi_image_converter_convert_memory(
         }
     }
 }
+
 #[no_mangle]
-pub extern "C" fn ric_free_buffer(ptr: *mut u8, len: usize) {
-    if ptr.is_null() {
-        return;
+pub extern "C" fn ffi_image_converter_convert_batch(
+    handle: *mut FfiImageConverter,
+    input_ptrs: *const *const u8,
+    input_lens: *const usize,
+    count: usize,
+    out_ptrs: *mut *mut u8,
+    out_lens: *mut usize,
+    out_errors: *mut FfiErrorCode,
+) -> FfiErrorCode {
+    if handle.is_null() || input_ptrs.is_null() || input_lens.is_null() 
+        || count == 0 || out_ptrs.is_null() || out_lens.is_null() {
+        set_last_error("Invalid parameters");
+        return FfiErrorCode::InvalidParameter;
     }
 
     unsafe {
-        Vec::from_raw_parts(ptr, len, len);
+        let input_ptr_slice = slice::from_raw_parts(input_ptrs, count);
+        let input_len_slice = slice::from_raw_parts(input_lens, count);
+        
+        let inputs: Vec<&[u8]> = input_ptr_slice.iter()
+            .zip(input_len_slice.iter())
+            .map(|(&ptr, &len)| slice::from_raw_parts(ptr, len))
+            .collect();
+
+        let conv = match (*handle).inner.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                set_last_error("Failed to lock converter");
+                return FfiErrorCode::Unknown;
+            }
+        };
+
+        let results = conv.convert_batch(&inputs);
+
+        let out_ptr_slice = slice::from_raw_parts_mut(out_ptrs, count);
+        let out_len_slice = slice::from_raw_parts_mut(out_lens, count);
+        let mut out_err_slice = if !out_errors.is_null() {
+            Some(slice::from_raw_parts_mut(out_errors, count))
+        } else {
+            None
+        };
+
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(mut vec) => {
+                    vec.shrink_to_fit();
+                    let size = vec.len();
+                    
+                    if size == 0 {
+                        out_ptr_slice[i] = ptr::null_mut();
+                        out_len_slice[i] = 0;
+                    } else {
+                        let mem = vec.as_mut_ptr();
+                        std::mem::forget(vec);
+                        out_ptr_slice[i] = mem;
+                        out_len_slice[i] = size;
+                    }
+                    
+                    if let Some(ref mut errs) = out_err_slice {
+                        errs[i] = FfiErrorCode::Success;
+                    }
+                }
+                Err(e) => {
+                    out_ptr_slice[i] = ptr::null_mut();
+                    out_len_slice[i] = 0;
+                    
+                    if let Some(ref mut errs) = out_err_slice {
+                        errs[i] = FfiErrorCode::from(&e);
+                    }
+                }
+            }
+        }
+
+        FfiErrorCode::Success
     }
 }
+
+#[no_mangle]
+pub extern "C" fn ric_free_buffer(ptr: *mut u8, len: usize) {
+    if !ptr.is_null() {
+        unsafe {
+            Vec::from_raw_parts(ptr, len, len);
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn ffi_image_converter_get_image_info(
     input_ptr: *const u8,
@@ -390,7 +556,7 @@ pub extern "C" fn ffi_image_converter_get_image_info(
     out_info: *mut FfiImageInfo,
 ) -> FfiErrorCode {
     if input_ptr.is_null() || input_len == 0 || out_info.is_null() {
-        set_last_error("Invalid pointer/length/out_info");
+        set_last_error("Invalid parameters");
         return FfiErrorCode::InvalidParameter;
     }
 
@@ -423,29 +589,6 @@ pub extern "C" fn ffi_image_converter_get_image_info(
             }
         }
     }
-}
-#[no_mangle]
-pub extern "C" fn ffi_image_converter_new_with_settings(
-    format: FfiFormat,
-    jpeg: *const FfiJpegSettings,
-    png: *const FfiPngSettings,
-) -> *mut FfiImageConverter {
-    let rust_format: Format = format.into();
-    let mut conv = ImageConverter::new(rust_format);
-
-    unsafe {
-        if !jpeg.is_null() {
-            conv.compression.jpeg = (*jpeg).clone().into();
-        }
-        if !png.is_null() {
-            conv.compression.png = (*png).clone().into();
-        }
-    }
-
-    let boxed = Box::new(FfiImageConverter {
-        inner: Box::into_raw(Box::new(conv)),
-    });
-    Box::into_raw(boxed)
 }
 
 #[repr(C)]
@@ -493,9 +636,13 @@ pub extern "C" fn ffi_image_converter_set_webp_settings(
     }
 
     unsafe {
-        let conv = &mut *(*handle).inner;
-        conv.compression.webp = settings.into();
-        FfiErrorCode::Success
+        if let Ok(mut conv) = (*handle).inner.lock() {
+            conv.compression.webp = settings.into();
+            FfiErrorCode::Success
+        } else {
+            set_last_error("Failed to lock converter");
+            FfiErrorCode::Unknown
+        }
     }
 }
 
@@ -537,9 +684,13 @@ pub extern "C" fn ffi_image_converter_set_tiff_settings(
     }
 
     unsafe {
-        let conv = &mut *(*handle).inner;
-        conv.compression.tiff = settings.into();
-        FfiErrorCode::Success
+        if let Ok(mut conv) = (*handle).inner.lock() {
+            conv.compression.tiff = settings.into();
+            FfiErrorCode::Success
+        } else {
+            set_last_error("Failed to lock converter");
+            FfiErrorCode::Unknown
+        }
     }
 }
 
@@ -574,9 +725,13 @@ pub extern "C" fn ffi_image_converter_set_ico_settings(
     }
 
     unsafe {
-        let conv = &mut *(*handle).inner;
-        conv.compression.ico = settings.into();
-        FfiErrorCode::Success
+        if let Ok(mut conv) = (*handle).inner.lock() {
+            conv.compression.ico = settings.into();
+            FfiErrorCode::Success
+        } else {
+            set_last_error("Failed to lock converter");
+            FfiErrorCode::Unknown
+        }
     }
 }
 
@@ -623,9 +778,13 @@ pub extern "C" fn ffi_image_converter_set_dds_settings(
     }
 
     unsafe {
-        let conv = &mut *(*handle).inner;
-        conv.compression.dds = settings.into();
-        FfiErrorCode::Success
+        if let Ok(mut conv) = (*handle).inner.lock() {
+            conv.compression.dds = settings.into();
+            FfiErrorCode::Success
+        } else {
+            set_last_error("Failed to lock converter");
+            FfiErrorCode::Unknown
+        }
     }
 }
 
@@ -658,8 +817,12 @@ pub extern "C" fn ffi_image_converter_set_gif_settings(
     }
 
     unsafe {
-        let conv = &mut *(*handle).inner;
-        conv.compression.gif = settings.into();
-        FfiErrorCode::Success
+        if let Ok(mut conv) = (*handle).inner.lock() {
+            conv.compression.gif = settings.into();
+            FfiErrorCode::Success
+        } else {
+            set_last_error("Failed to lock converter");
+            FfiErrorCode::Unknown
+        }
     }
 }
