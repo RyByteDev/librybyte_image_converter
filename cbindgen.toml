@@ -1,0 +1,10 @@
+include_version = true
+autogen_warning = "/* Automatically generated, do not edit */"
+
+[parse]
+parse_deps = false
+clean = true
+
+[header]
+language = "C"
+style = "both"
